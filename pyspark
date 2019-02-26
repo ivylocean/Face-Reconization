@@ -1,0 +1,86 @@
+### read data
+# sc.stop()
+from pyspark import SparkContext
+sc = SparkContext("local", "Simple App")
+sqlContext = SQLContext(sc)
+df = sqlContext.read.format('com.databricks.spark.csv') \
+    .options(header=False, inferschema='true') \
+    .load("file:///home/lifeng/pku/LTX/face2.csv")
+df = df.withColumnRenamed("_c1024","label")
+## Transform 1024 features into MMlib vectors
+assembler = VectorAssembler(
+    inputCols=['_c%d' % i for i in range(1024)],
+    outputCol="features")
+output = assembler.transform(df)
+## scale
+standardizer = StandardScaler(withMean=True, withStd=True,
+                              inputCol='features',
+                              outputCol='std_features')
+model = standardizer.fit(output)
+output = model.transform(output)
+indexer = StringIndexer(inputCol="label", outputCol="label_idx")
+indexed = indexer.fit(output).transform(output)
+df2 = indexed.select(['std_features', 'label'])
+df2.show(n=5)
+### dimension reduction
+## pca
+pca = PCA(k=30, inputCol="std_features", outputCol="pca")
+model = pca.fit(df2)
+sum(model.explainedVariance) # 87.54%(face10) 90.72%(face) 
+transformed = model.transform(df2)
+
+## change data type into an RDD of vectors
+# newdata = transformed.select('pca').rdd.map(lambda x: np.array(x))
+# newdata.take(3)
+newdata = transformed.select('pca')
+newdata.show()
+
+## combine label
+import pyspark.sql.functions as f
+df2=df2.withColumn('row_index', f.monotonically_increasing_id())
+newdata=newdata.withColumn('row_index', f.monotonically_increasing_id())
+newdata = newdata.join(df2, on=["row_index"]).sort("row_index").drop("std_features", "row_index")
+newdata.show(n=3)
+newdata = newdata.withColumnRenamed("pca","features")
+
+## change into label point type
+data = newdata.rdd.map(lambda row: LabeledPoint(row['label'], row['features'].toArray()))
+train, test = data.randomSplit([0.7, 0.3])
+### classification
+## svm
+def model_for_class(c, rdd):
+    def adjust_label(lp):
+        return LabeledPoint(1 if lp.label == c else 0, lp.features)
+    
+    model = SVMWithSGD.train(rdd.map(adjust_label))
+    model.clearThreshold()
+    return model
+
+classes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+models = [model_for_class(c, train) for c in classes]
+
+pred = [(x.label, np.argmax([model.predict(x.features) for model in models]))
+       for x in test.collect()]
+
+acc = 0
+for i in range(187):
+    if pred[i][0] == pred[i][1]:
+        acc += 1
+# acc = 145        
+acc/183 # 79.23%
+
+### NaiveBayes
+
+# 使用未降維的原始資料
+train, test = output.randomSplit([0.7, 0.3])
+nb = NaiveBayes(smoothing=1.0, modelType="multinomial")
+
+# train the model
+model = nb.fit(train)
+result = model.transform(test)
+predictionAndLabels = result.select("prediction", "label")
+evaluator = MulticlassClassificationEvaluator(metricName="accuracy")
+print("Accuracy: " + str(evaluator.evaluate(predictionAndLabels))) # 66.86%
+
+
+
