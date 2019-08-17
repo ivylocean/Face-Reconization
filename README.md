@@ -4,4 +4,4 @@
 
 故此數據集為38*1024
 
-分別在利用python集pyspark完成分析
+分別在利用python及pyspark完成分析
